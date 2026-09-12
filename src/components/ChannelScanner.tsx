@@ -28,7 +28,8 @@ export const ChannelScanner: React.FC<ChannelScannerProps> = ({
   const [includeVideos, setIncludeVideos] = useState(true);
   const [includeShorts, setIncludeShorts] = useState(true);
   const [includeLive, setIncludeLive] = useState(true);
-  const [scanDepth, setScanDepth] = useState<'quick' | 'standard' | 'deep'>('standard');
+  const [includeMembers, setIncludeMembers] = useState(true);
+  const [scanDepth, setScanDepth] = useState<'quick' | 'standard' | 'deep' | 'all'>('standard');
   const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest');
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -41,6 +42,7 @@ export const ChannelScanner: React.FC<ChannelScannerProps> = ({
       includeVideos,
       includeShorts,
       includeLive,
+      includeMembers,
       scanDepth,
       sortOrder,
       filterAccessType: 'all',
@@ -186,6 +188,22 @@ export const ChannelScanner: React.FC<ChannelScannerProps> = ({
               )}
               <span>Live Streams</span>
             </label>
+
+            <label className="flex items-center gap-1.5 cursor-pointer text-amber-300 hover:text-amber-200 select-none bg-amber-500/10 px-2 py-0.5 rounded-md border border-amber-500/30">
+              <input
+                type="checkbox"
+                checked={includeMembers}
+                onChange={(e) => setIncludeMembers(e.target.checked)}
+                disabled={isScanning}
+                className="sr-only"
+              />
+              {includeMembers ? (
+                <CheckSquare className="w-4 h-4 text-amber-400" />
+              ) : (
+                <Square className="w-4 h-4 text-zinc-600" />
+              )}
+              <span className="font-semibold text-amber-300">Members 🔒</span>
+            </label>
           </div>
 
           {/* Depth & Sort Controls */}
@@ -201,6 +219,7 @@ export const ChannelScanner: React.FC<ChannelScannerProps> = ({
                 <option value="quick">Quick (30 items)</option>
                 <option value="standard">Standard (100 items)</option>
                 <option value="deep">Comprehensive (250 items)</option>
+                <option value="all">Entire Channel (All Available)</option>
               </select>
             </div>
 

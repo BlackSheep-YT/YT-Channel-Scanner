@@ -94,6 +94,10 @@ export const POPUP_HTML = `<!DOCTYPE html>
             <input type="checkbox" id="tabLive" checked />
             <span>Live</span>
           </label>
+          <label class="pill-checkbox pill-members">
+            <input type="checkbox" id="tabMembers" checked />
+            <span>Members 🔒</span>
+          </label>
         </div>
       </div>
 
@@ -101,10 +105,11 @@ export const POPUP_HTML = `<!DOCTYPE html>
         <div class="config-item">
           <label for="scanDepth" class="config-label">Depth:</label>
           <select id="scanDepth" class="select-input">
-            <option value="30">Quick (30)</option>
-            <option value="100" selected>Deep (100)</option>
-            <option value="250">Heavy (250)</option>
-            <option value="1000">All Available</option>
+            <option value="100">100 Items</option>
+            <option value="500">500 Items</option>
+            <option value="1000">1,000 Items</option>
+            <option value="3000">3,000 Items</option>
+            <option value="50000" selected>All Available</option>
           </select>
         </div>
         <div class="config-item">
@@ -351,6 +356,13 @@ body {
   background: #ff003322;
   border-color: #ff0033;
   color: #ff4d6a;
+  font-weight: 600;
+}
+
+.pill-checkbox.pill-members input:checked + span {
+  background: #f59e0b25;
+  border-color: #f59e0b;
+  color: #fbbf24;
   font-weight: 600;
 }
 
@@ -638,9 +650,23 @@ let isScanning = false;
 
 document.addEventListener('DOMContentLoaded', async () => {
   initDOMElements();
+  restoreSavedScan();
   await checkActiveTab();
   setupEventListeners();
 });
+
+function restoreSavedScan() {
+  if (chrome.storage && chrome.storage.local) {
+    chrome.storage.local.get(['lastScannedVideos'], (res) => {
+      if (res.lastScannedVideos && res.lastScannedVideos.length > 0) {
+        scannedVideos = res.lastScannedVideos;
+        dom.resultsSection.style.display = 'block';
+        updateStats();
+        renderVideoList();
+      }
+    });
+  }
+}
 
 let dom = {};
 
@@ -654,6 +680,7 @@ function initDOMElements() {
     tabVideos: document.getElementById('tabVideos'),
     tabShorts: document.getElementById('tabShorts'),
     tabLive: document.getElementById('tabLive'),
+    tabMembers: document.getElementById('tabMembers'),
     scanDepth: document.getElementById('scanDepth'),
     sortOrder: document.getElementById('sortOrder'),
     startScanBtn: document.getElementById('startScanBtn'),
@@ -782,11 +809,13 @@ function startScanning() {
   dom.statusMessage.textContent = 'Initiating channel scanner...';
   dom.itemCounter.textContent = '0 items';
 
+  const depthVal = parseInt(dom.scanDepth.value, 10);
   const options = {
     includeVideos: dom.tabVideos.checked,
     includeShorts: dom.tabShorts.checked,
     includeLive: dom.tabLive.checked,
-    depth: parseInt(dom.scanDepth.value, 10),
+    includeMembers: dom.tabMembers ? dom.tabMembers.checked : true,
+    depth: depthVal || 50000,
     sortOrder: dom.sortOrder.value,
   };
 
@@ -871,6 +900,12 @@ function updateStats() {
   dom.totalCount.textContent = total;
   dom.membersCount.textContent = membersOnly;
   dom.publicCount.textContent = pub;
+
+  if (chrome.storage && chrome.storage.local) {
+    try {
+      chrome.storage.local.set({ lastScannedVideos: scannedVideos });
+    } catch (e) {}
+  }
 }
 
 function renderVideoList() {
@@ -1059,12 +1094,35 @@ async function runChannelScan(options) {
   const collectedVideos = [];
   const seenIds = new Set();
 
+  // 1. Immediately extract any currently visible members-only videos from the active page DOM
+  const domMembers = extractVisibleDOMVideos();
+  for (const v of domMembers) {
+    if (!seenIds.has(v.id)) {
+      seenIds.add(v.id);
+      collectedVideos.push(v);
+    }
+  }
+
+  if (collectedVideos.length > 0) {
+    chrome.runtime.sendMessage({
+      action: 'SCAN_PROGRESS',
+      progress: 5,
+      message: \`Detected \${collectedVideos.length} Members-Only items on screen\`,
+      count: collectedVideos.length,
+      newVideos: [...collectedVideos]
+    });
+  }
+
   const tabsToScan = [];
   if (options.includeVideos) tabsToScan.push({ tab: 'videos', category: 'Video' });
   if (options.includeShorts) tabsToScan.push({ tab: 'shorts', category: 'Shorts' });
   if (options.includeLive) tabsToScan.push({ tab: 'streams', category: 'Live' });
+  if (options.includeMembers !== false) {
+    tabsToScan.push({ tab: 'membership', category: 'Members-Only' });
+  }
 
-  const maxTotal = options.depth || 100;
+  // Default depth: 50,000 for "All Available", or user chosen depth
+  const maxTotal = options.depth && options.depth > 0 ? options.depth : 50000;
 
   for (let i = 0; i < tabsToScan.length; i++) {
     if (!isScanActive) break;
@@ -1080,30 +1138,286 @@ async function runChannelScan(options) {
 
     try {
       const tabUrl = \`\${channelBase}/\${tab}?hl=en\`;
-      const tabVideos = await fetchAndParseTab(tabUrl, category, maxTotal - collectedVideos.length);
-      
-      const newItems = [];
-      for (const v of tabVideos) {
-        if (!seenIds.has(v.id)) {
-          seenIds.add(v.id);
-          collectedVideos.push(v);
-          newItems.push(v);
-        }
-      }
+      const remainingLimit = maxTotal - collectedVideos.length;
+      if (remainingLimit <= 0) break;
 
-      chrome.runtime.sendMessage({
-        action: 'SCAN_PROGRESS',
-        progress: Math.round(((i + 1) / tabsToScan.length) * 100),
-        message: \`Found \${newItems.length} \${category} items\`,
-        count: collectedVideos.length,
-        newVideos: newItems
+      await fetchAndParseTabWithContinuations(tabUrl, category, remainingLimit, (batch) => {
+        if (!isScanActive) return;
+        const uniqueBatch = [];
+        for (const v of batch) {
+          if (!seenIds.has(v.id)) {
+            seenIds.add(v.id);
+            collectedVideos.push(v);
+            uniqueBatch.push(v);
+          }
+        }
+        if (uniqueBatch.length > 0) {
+          const tabPercent = Math.min(Math.round(((i + 0.5) / tabsToScan.length) * 100), 95);
+          chrome.runtime.sendMessage({
+            action: 'SCAN_PROGRESS',
+            progress: tabPercent,
+            message: \`Scanned \${collectedVideos.length} items (scanning \${category})...\`,
+            count: collectedVideos.length,
+            newVideos: uniqueBatch
+          });
+        }
       });
     } catch (e) {
       console.warn(\`Error scanning \${tab}: \`, e);
     }
   }
 
+  // Cache in local extension storage so data is not lost
+  if (chrome.storage && chrome.storage.local) {
+    try {
+      chrome.storage.local.set({ lastScannedVideos: collectedVideos, lastScanTime: Date.now() });
+    } catch (e) {}
+  }
+
   return collectedVideos;
+}
+
+function extractVisibleDOMVideos() {
+  const domVideos = [];
+  try {
+    const badgeElements = document.querySelectorAll(
+      'ytd-badge-supported-renderer.badge-style-type-members-only, ' +
+      'ytd-badge-supported-renderer[aria-label*="Members only"], ' +
+      'ytd-badge-supported-renderer[aria-label*="Member-only"], ' +
+      '.badge-shape-wiz--members-only, ' +
+      'yt-icon[icon="sponsor"], ' +
+      'yt-icon[icon="membership"]'
+    );
+
+    for (const badge of badgeElements) {
+      const card = badge.closest('ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, yt-lockup-view-model');
+      if (!card) continue;
+
+      const linkEl = card.querySelector('a#video-title-link, a#video-title, a.yt-lockup-metadata-view-model__title, a[href*="/watch?v="], a[href*="/shorts/"]');
+      if (!linkEl) continue;
+
+      const href = linkEl.getAttribute('href') || '';
+      const vMatch = href.match(/[?&]v=([^&]+)/) || href.match(/\/shorts\/([^/?]+)/);
+      if (!vMatch) continue;
+
+      const videoId = vMatch[1];
+      const title = (linkEl.textContent || linkEl.getAttribute('title') || 'Members-Only Video').trim();
+      const thumbEl = card.querySelector('img');
+      const thumb = thumbEl ? thumbEl.src : ('https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg');
+
+      domVideos.push({
+        id: videoId,
+        title: title,
+        link: href.startsWith('http') ? href : ('https://www.youtube.com' + href),
+        date: new Date().toISOString().split('T')[0],
+        rawDate: 'Members Only',
+        timestamp: Date.now(),
+        category: 'Members-Only',
+        accessType: 'Members-only',
+        membershipLevel: 'Members only',
+        thumbnailUrl: thumb
+      });
+    }
+  } catch (err) {
+    console.warn('DOM members extraction notice:', err);
+  }
+  return domVideos;
+}
+
+function detectMembersOnly(rawNode, defaultCategory) {
+  if (defaultCategory === 'Members-Only' || defaultCategory === 'Membership') {
+    return { isMembersOnly: true, level: 'Members only' };
+  }
+  if (!rawNode) return { isMembersOnly: false, level: 'Public' };
+
+  try {
+    const str = typeof rawNode === 'string' ? rawNode : JSON.stringify(rawNode);
+    const isMember = 
+      str.includes('BADGE_STYLE_TYPE_MEMBERS_ONLY') ||
+      str.includes('MEMBERS_ONLY') ||
+      str.includes('"iconType":"SPONSOR"') ||
+      str.includes('"iconType":"MEMBERSHIP"') ||
+      /["'](?:Members[- ]only|Member[- ]only|Exclusive for members|Join to watch|Members only video)["']/i.test(str) ||
+      /badgeText.*?["'](?:[^"']*[Mm]ember[^"']*)["']/i.test(str) ||
+      /accessibility.*?["'](?:[^"']*[Mm]ember[^"']*)["']/i.test(str) ||
+      /label.*?["'](?:[^"']*[Mm]ember[^"']*)["']/i.test(str);
+
+    if (isMember) {
+      let level = 'Members only';
+      const match = str.match(/"(?:badgeText|label|accessibilityText)":\s*"([^"]*[Mm]ember[^"]*)"/i);
+      if (match && match[1]) {
+        level = match[1].replace(/\\n/g, ' ').trim();
+      }
+      return { isMembersOnly: true, level };
+    }
+  } catch (e) {}
+
+  return { isMembersOnly: false, level: 'Public' };
+}
+
+function findMembersOnlyChipToken(ytData) {
+  if (!ytData) return null;
+  try {
+    const jsonStr = JSON.stringify(ytData);
+    if (!/members[- ]only|member[- ]only/i.test(jsonStr)) return null;
+
+    const tabs = ytData?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+    for (const tab of tabs) {
+      const chips = tab.tabRenderer?.content?.richGridRenderer?.header?.feedFilterChipBarRenderer?.chips
+        || tab.tabRenderer?.content?.sectionListRenderer?.header?.feedFilterChipBarRenderer?.chips;
+      if (chips && Array.isArray(chips)) {
+        for (const chip of chips) {
+          const cRenderer = chip.chipCloudChipRenderer;
+          const text = cRenderer?.text?.runs?.[0]?.text || cRenderer?.text?.simpleText || '';
+          if (/members[- ]only|member/i.test(text)) {
+            const token = cRenderer.navigationEndpoint?.continuationEndpoint?.continuationCommand?.token
+              || cRenderer.continuation?.reloadContinuationData?.continuation
+              || findContinuationToken(cRenderer);
+            if (token) return token;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+function deepCollectItems(node, defaultCategory, itemsList) {
+  if (!node || typeof node !== 'object') return;
+
+  // If node is an itemSection or shelf, check if the title mentions members
+  let currentCategory = defaultCategory;
+  if (node.shelfRenderer?.title) {
+    const shelfTitle = JSON.stringify(node.shelfRenderer.title);
+    if (/members/i.test(shelfTitle)) {
+      currentCategory = 'Members-Only';
+    }
+  }
+
+  // Check direct video shapes
+  if (node.videoId || node.contentId || (node.entityId && typeof node.entityId === 'string' && node.entityId.startsWith('shorts-shelf-item-'))) {
+    const parsed = parseRawItem(node, currentCategory);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.richItemRenderer?.content) {
+    const parsed = parseRawItem(node.richItemRenderer.content, currentCategory);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.videoRenderer) {
+    const parsed = parseVideoRenderer(node.videoRenderer, currentCategory);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.gridVideoRenderer) {
+    const parsed = parseGridVideoRenderer(node.gridVideoRenderer, currentCategory);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.lockupViewModel) {
+    const parsed = parseLockupViewModel(node.lockupViewModel, currentCategory);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.shortsLockupViewModel) {
+    const parsed = parseShortsLockupViewModel(node.shortsLockupViewModel);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  if (node.reelItemRenderer) {
+    const parsed = parseReelItemRenderer(node.reelItemRenderer);
+    if (parsed) {
+      itemsList.push(parsed);
+      return;
+    }
+  }
+
+  // Recurse into arrays and objects
+  if (Array.isArray(node)) {
+    for (const el of node) {
+      deepCollectItems(el, currentCategory, itemsList);
+    }
+  } else {
+    for (const key of Object.keys(node)) {
+      if (key === 'continuationItemRenderer' || key === 'continuationEndpoint' || key === 'header' || key === 'commandContext') continue;
+      if (typeof node[key] === 'object' && node[key] !== null) {
+        deepCollectItems(node[key], currentCategory, itemsList);
+      }
+    }
+  }
+}
+
+async function fetchContinuationItemsBatch(apiKey, clientVersion, token, category, limit, onProgressBatch) {
+  let currentToken = token;
+  let fetched = 0;
+  let pages = 0;
+
+  while (currentToken && isScanActive && fetched < limit && pages < 100) {
+    pages++;
+    await new Promise(r => setTimeout(r, 100));
+    if (!isScanActive) break;
+
+    const browseUrl = \`https://www.youtube.com/youtubei/v1/browse?key=\${apiKey}&prettyPrint=false\`;
+    const res = await fetch(browseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      credentials: 'include',
+      body: JSON.stringify({
+        context: {
+          client: { clientName: 'WEB', clientVersion: clientVersion, hl: 'en', gl: 'US' }
+        },
+        continuation: currentToken
+      })
+    });
+
+    if (!res.ok) break;
+    const data = await res.json();
+    const actions = data.onResponseReceivedActions || data.onResponseReceivedEndpoints || [];
+    const batch = [];
+    let next = null;
+
+    for (const act of actions) {
+      const items = act.appendContinuationItemsAction?.continuationItems || act.reloadContinuationItemsCommand?.continuationItems || [];
+      for (const it of items) {
+        if (it.continuationItemRenderer) {
+          next = findContinuationToken(it.continuationItemRenderer);
+        } else {
+          deepCollectItems(it, category, batch);
+        }
+      }
+    }
+
+    if (batch.length > 0 && onProgressBatch) {
+      onProgressBatch(batch);
+      fetched += batch.length;
+    }
+
+    if (!next) next = findContinuationToken(actions);
+    if (!next || next === currentToken) break;
+    currentToken = next;
+  }
 }
 
 function getChannelBaseUrl(url) {
@@ -1117,10 +1431,10 @@ function getChannelBaseUrl(url) {
       return \`https://www.youtube.com/\${parts[0]}/\${parts[1]}\`;
     }
   }
-  return \`https://www.youtube.com\${urlObj.pathname}\`.replace(/\\/(videos|shorts|streams|playlists|community|channels|about)/, '');
+  return \`https://www.youtube.com\${urlObj.pathname}\`.replace(/\\/(videos|shorts|streams|playlists|community|channels|about).*/, '');
 }
 
-async function fetchAndParseTab(tabUrl, category, limit) {
+async function fetchAndParseTabWithContinuations(tabUrl, category, limit, onProgressBatch) {
   const res = await fetch(tabUrl, {
     headers: {
       'Accept-Language': 'en-US,en;q=0.9',
@@ -1129,50 +1443,238 @@ async function fetchAndParseTab(tabUrl, category, limit) {
   });
   const html = await res.text();
 
+  // Extract INNERTUBE_API_KEY and CLIENT_VERSION
+  let apiKey = '';
+  let clientVersion = '2.20240901.00.00';
+  const keyMatch = html.match(/"INNERTUBE_API_KEY":\\s*"([^"]+)"/);
+  if (keyMatch) apiKey = keyMatch[1];
+  const verMatch = html.match(/"INNERTUBE_CLIENT_VERSION":\\s*"([^"]+)"/);
+  if (verMatch) clientVersion = verMatch[1];
+
   // Extract ytInitialData
   const match = html.match(/ytInitialData\\s*=\\s*({.+?});<\\/script>/s);
-  if (!match) return [];
+  if (!match) return;
 
   let ytInitialData;
   try {
     ytInitialData = JSON.parse(match[1]);
   } catch (err) {
-    return [];
+    return;
   }
 
-  const items = extractItemsFromYtData(ytInitialData, category);
-  return items.slice(0, limit);
-}
+  const tabs = ytInitialData?.contents?.twoColumnBrowseResultsRenderer?.tabs;
+  const selectedTab = tabs?.find(t => t.tabRenderer?.selected) || tabs?.[1] || tabs?.[0];
 
-function extractItemsFromYtData(data, defaultCategory) {
-  const results = [];
-  const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs;
-  if (!tabs) return results;
+  let tabItemCount = 0;
+  let continuationToken = null;
 
-  const selectedTab = tabs.find(t => t.tabRenderer?.selected) || tabs[1] || tabs[0];
-  const contents = selectedTab?.tabRenderer?.content?.richGridRenderer?.contents 
-    || selectedTab?.tabRenderer?.content?.sectionListRenderer?.contents;
+  // Deep collect all video items from the tab content
+  if (selectedTab) {
+    const initialBatch = [];
+    deepCollectItems(selectedTab, category, initialBatch);
+    if (initialBatch.length > 0 && onProgressBatch) {
+      onProgressBatch(initialBatch);
+      tabItemCount += initialBatch.length;
+    }
+    continuationToken = findContinuationToken(selectedTab);
+  }
 
-  if (!contents || !Array.isArray(contents)) return results;
-
-  for (const item of contents) {
-    const richItem = item.richItemRenderer?.content;
-    if (!richItem) continue;
-
-    // Standard Video or Live Stream
-    if (richItem.lockupViewModel) {
-      const v = parseLockupViewModel(richItem.lockupViewModel, defaultCategory);
-      if (v) results.push(v);
-    } else if (richItem.videoRenderer) {
-      const v = parseVideoRenderer(richItem.videoRenderer, defaultCategory);
-      if (v) results.push(v);
-    } else if (richItem.shortsLockupViewModel) {
-      const s = parseShortsLockupViewModel(richItem.shortsLockupViewModel);
-      if (s) results.push(s);
+  // Check if a dedicated "Members only" chip exists on the tab!
+  const membersChipToken = findMembersOnlyChipToken(ytInitialData);
+  if (membersChipToken && isScanActive) {
+    try {
+      await fetchContinuationItemsBatch(apiKey, clientVersion, membersChipToken, 'Members-Only', limit, (chipBatch) => {
+        if (chipBatch.length > 0 && onProgressBatch) {
+          onProgressBatch(chipBatch);
+          tabItemCount += chipBatch.length;
+        }
+      });
+    } catch (err) {
+      console.warn('Members chip fetch notice:', err);
     }
   }
 
-  return results;
+  // CONTINUATION LOOP: Iteratively fetch more batches of videos (supports 1,000s)
+  let pageCount = 1;
+  const maxPages = 400; // up to ~12,000 items per tab
+
+  while (continuationToken && isScanActive && tabItemCount < limit && pageCount < maxPages) {
+    pageCount++;
+    await new Promise(r => setTimeout(r, 120)); // polite throttle
+    if (!isScanActive) break;
+
+    try {
+      const browseUrl = \`https://www.youtube.com/youtubei/v1/browse?key=\${apiKey}&prettyPrint=false\`;
+      const browseRes = await fetch(browseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'WEB',
+              clientVersion: clientVersion,
+              hl: 'en',
+              gl: 'US'
+            }
+          },
+          continuation: continuationToken
+        })
+      });
+
+      if (!browseRes.ok) break;
+
+      const data = await browseRes.json();
+      const actions = data.onResponseReceivedActions || data.onResponseReceivedEndpoints || [];
+      const continuationBatch = [];
+      let nextToken = null;
+
+      for (const act of actions) {
+        const continuationItems = 
+          act.appendContinuationItemsAction?.continuationItems ||
+          act.reloadContinuationItemsCommand?.continuationItems ||
+          [];
+
+        for (const ci of continuationItems) {
+          if (ci.continuationItemRenderer) {
+            nextToken = findContinuationToken(ci.continuationItemRenderer);
+          } else {
+            deepCollectItems(ci, category, continuationBatch);
+          }
+        }
+      }
+
+      if (continuationBatch.length > 0 && onProgressBatch) {
+        onProgressBatch(continuationBatch);
+        tabItemCount += continuationBatch.length;
+      }
+
+      if (!nextToken) {
+        nextToken = findContinuationToken(actions);
+      }
+
+      if (!nextToken || nextToken === continuationToken) {
+        break;
+      }
+      continuationToken = nextToken;
+    } catch (err) {
+      console.warn('Continuation pagination error:', err);
+      break;
+    }
+  }
+}
+
+function findContinuationToken(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (obj.continuationCommand && typeof obj.continuationCommand.token === 'string') {
+    return obj.continuationCommand.token;
+  }
+  if (obj.continuationItemRenderer) {
+    return findContinuationToken(obj.continuationItemRenderer);
+  }
+  if (obj.continuationEndpoint) {
+    return findContinuationToken(obj.continuationEndpoint);
+  }
+  if (Array.isArray(obj)) {
+    for (let i = obj.length - 1; i >= 0; i--) {
+      const t = findContinuationToken(obj[i]);
+      if (t) return t;
+    }
+  }
+  for (const k of Object.keys(obj)) {
+    if (typeof obj[k] === 'object' && obj[k] !== null) {
+      const t = findContinuationToken(obj[k]);
+      if (t) return t;
+    }
+  }
+  return null;
+}
+
+function parseRawItem(item, defaultCategory) {
+  if (!item) return null;
+  const content = item.richItemRenderer?.content || item;
+
+  if (content.lockupViewModel) {
+    return parseLockupViewModel(content.lockupViewModel, defaultCategory);
+  }
+  if (content.videoRenderer) {
+    return parseVideoRenderer(content.videoRenderer, defaultCategory);
+  }
+  if (content.gridVideoRenderer) {
+    return parseGridVideoRenderer(content.gridVideoRenderer, defaultCategory);
+  }
+  if (content.shortsLockupViewModel) {
+    return parseShortsLockupViewModel(content.shortsLockupViewModel);
+  }
+  if (content.reelItemRenderer) {
+    return parseReelItemRenderer(content.reelItemRenderer);
+  }
+  return null;
+}
+
+function parseGridVideoRenderer(renderer, defaultCategory) {
+  const videoId = renderer.videoId;
+  if (!videoId) return null;
+
+  const title = renderer.title?.runs?.[0]?.text || renderer.title?.simpleText || 'Untitled Video';
+  const rawDate = renderer.publishedTimeText?.simpleText || 'Unknown';
+  const { date, timestamp } = parseDate(rawDate);
+
+  let accessType = 'Public';
+  let membershipLevel = 'Public';
+
+  const memberCheck = detectMembersOnly(renderer, defaultCategory);
+  if (memberCheck.isMembersOnly) {
+    accessType = 'Members-only';
+    membershipLevel = memberCheck.level;
+  } else if (renderer.badges && Array.isArray(renderer.badges)) {
+    for (const b of renderer.badges) {
+      const badge = b.metadataBadgeRenderer;
+      if (badge && (badge.style === 'BADGE_STYLE_TYPE_MEMBERS_ONLY' || badge.label?.toLowerCase().includes('member'))) {
+        accessType = 'Members-only';
+        membershipLevel = badge.label || 'Members only';
+      }
+    }
+  }
+
+  return {
+    id: videoId,
+    title,
+    link: \`https://www.youtube.com/watch?v=\${videoId}\`,
+    date,
+    rawDate,
+    timestamp,
+    category: accessType === 'Members-only' && defaultCategory === 'Video' ? 'Members-Only' : defaultCategory,
+    accessType,
+    membershipLevel: accessType === 'Members-only' ? (membershipLevel || 'Members only') : 'Public',
+    thumbnailUrl: renderer.thumbnail?.thumbnails?.[0]?.url || \`https://i.ytimg.com/vi/\${videoId}/hqdefault.jpg\`
+  };
+}
+
+function parseReelItemRenderer(reel) {
+  const videoId = reel.videoId;
+  if (!videoId) return null;
+
+  const title = reel.headline?.simpleText || reel.accessibilityText || 'Shorts Video';
+  const thumb = reel.thumbnail?.thumbnails?.[0]?.url || \`https://i.ytimg.com/vi/\${videoId}/frame0.jpg\`;
+
+  const memberCheck = detectMembersOnly(reel, 'Shorts');
+
+  return {
+    id: videoId,
+    title,
+    link: \`https://www.youtube.com/shorts/\${videoId}\`,
+    date: new Date().toISOString().split('T')[0],
+    rawDate: 'Recent Short',
+    timestamp: Date.now(),
+    category: memberCheck.isMembersOnly ? 'Members-Only' : 'Shorts',
+    accessType: memberCheck.isMembersOnly ? 'Members-only' : 'Public',
+    membershipLevel: memberCheck.isMembersOnly ? memberCheck.level : 'Public',
+    thumbnailUrl: thumb
+  };
 }
 
 function parseLockupViewModel(lockup, defaultCategory) {
@@ -1182,24 +1684,16 @@ function parseLockupViewModel(lockup, defaultCategory) {
   const titleMeta = lockup.metadata?.lockupMetadataViewModel;
   const title = titleMeta?.title?.content || 'Untitled Video';
 
-  // Check Members-Only Badges
   let accessType = 'Public';
   let membershipLevel = 'Public';
 
-  const badges = titleMeta?.badges || [];
-  for (const b of badges) {
-    const badgeVm = b.badgeViewModel;
-    if (badgeVm) {
-      const text = badgeVm.badgeText || '';
-      const style = badgeVm.badgeStyle || '';
-      if (style.includes('MEMBERS_ONLY') || text.toLowerCase().includes('member')) {
-        accessType = 'Members-only';
-        membershipLevel = text || 'Members only';
-      }
-    }
+  const memberCheck = detectMembersOnly(lockup, defaultCategory);
+  if (memberCheck.isMembersOnly) {
+    accessType = 'Members-only';
+    membershipLevel = memberCheck.level;
   }
 
-  // Also check metadata rows for lock or members text
+  // Also check metadata rows for date and text
   const rows = titleMeta?.metadata?.contentMetadataViewModel?.metadataRows || [];
   let rawDate = 'Unknown';
   for (const row of rows) {
@@ -1226,7 +1720,7 @@ function parseLockupViewModel(lockup, defaultCategory) {
     date,
     rawDate,
     timestamp,
-    category: defaultCategory,
+    category: accessType === 'Members-only' && defaultCategory === 'Video' ? 'Members-Only' : defaultCategory,
     accessType,
     membershipLevel: accessType === 'Members-only' ? (membershipLevel || 'Members only') : 'Public',
     thumbnailUrl: thumb
@@ -1244,7 +1738,11 @@ function parseVideoRenderer(renderer, defaultCategory) {
   let accessType = 'Public';
   let membershipLevel = 'Public';
 
-  if (renderer.badges && Array.isArray(renderer.badges)) {
+  const memberCheck = detectMembersOnly(renderer, defaultCategory);
+  if (memberCheck.isMembersOnly) {
+    accessType = 'Members-only';
+    membershipLevel = memberCheck.level;
+  } else if (renderer.badges && Array.isArray(renderer.badges)) {
     for (const b of renderer.badges) {
       const badge = b.metadataBadgeRenderer;
       if (badge) {
@@ -1263,7 +1761,7 @@ function parseVideoRenderer(renderer, defaultCategory) {
     date,
     rawDate,
     timestamp,
-    category: defaultCategory,
+    category: accessType === 'Members-only' && defaultCategory === 'Video' ? 'Members-Only' : defaultCategory,
     accessType,
     membershipLevel: accessType === 'Members-only' ? (membershipLevel || 'Members only') : 'Public',
     thumbnailUrl: renderer.thumbnail?.thumbnails?.[0]?.url || \`https://i.ytimg.com/vi/\${videoId}/hqdefault.jpg\`
@@ -1277,6 +1775,8 @@ function parseShortsLockupViewModel(shorts) {
   const title = shorts.accessibilityText || shorts.overlay?.reelPlayerOverlayRenderer?.reelPlayerHeaderSupportedRenderers?.reelPlayerHeaderRenderer?.headline?.simpleText || 'Shorts Video';
   const thumb = shorts.onTap?.innertubeCommand?.reelWatchEndpoint?.thumbnail?.thumbnails?.[0]?.url || \`https://i.ytimg.com/vi/\${videoId}/frame0.jpg\`;
 
+  const memberCheck = detectMembersOnly(shorts, 'Shorts');
+
   return {
     id: videoId,
     title,
@@ -1284,9 +1784,9 @@ function parseShortsLockupViewModel(shorts) {
     date: new Date().toISOString().split('T')[0],
     rawDate: 'Recent Short',
     timestamp: Date.now(),
-    category: 'Shorts',
-    accessType: 'Public',
-    membershipLevel: 'Public',
+    category: memberCheck.isMembersOnly ? 'Members-Only' : 'Shorts',
+    accessType: memberCheck.isMembersOnly ? 'Members-only' : 'Public',
+    membershipLevel: memberCheck.isMembersOnly ? memberCheck.level : 'Public',
     thumbnailUrl: thumb
   };
 }

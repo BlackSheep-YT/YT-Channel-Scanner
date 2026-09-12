@@ -1,4 +1,4 @@
-export type VideoCategory = 'Video' | 'Shorts' | 'Live';
+export type VideoCategory = 'Video' | 'Shorts' | 'Live' | 'Members-Only';
 export type VideoAccessType = 'Public' | 'Members-only';
 
 export interface ScannedVideo {
@@ -31,6 +31,7 @@ export interface ScanOptions {
   includeVideos: boolean;
   includeShorts: boolean;
   includeLive: boolean;
+  includeMembers?: boolean;
   scanDepth: 'quick' | 'standard' | 'deep' | 'all'; // 30, 100, 250, 500
   sortOrder: 'newest' | 'oldest';
   filterAccessType: 'all' | 'members-only' | 'public';

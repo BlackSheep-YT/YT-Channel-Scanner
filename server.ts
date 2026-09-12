@@ -13,7 +13,7 @@ interface RawItemResult {
   date: string;
   rawDate: string;
   timestamp: number;
-  category: 'Video' | 'Shorts' | 'Live';
+  category: 'Video' | 'Shorts' | 'Live' | 'Members-Only';
   accessType: 'Public' | 'Members-only';
   membershipLevel: string;
   thumbnailUrl: string;
@@ -121,8 +121,8 @@ function extractInnertubeApiKey(html: string): { apiKey: string | null; clientVe
   };
 }
 
-function parseItem(item: any, defaultCategory: 'Video' | 'Shorts' | 'Live'): RawItemResult | null {
-  const richItem = item.richItemRenderer?.content;
+function parseItem(item: any, defaultCategory: 'Video' | 'Shorts' | 'Live' | 'Members-Only'): RawItemResult | null {
+  const richItem = item.richItemRenderer?.content || item;
   if (!richItem) return null;
 
   // Modern lockupViewModel
@@ -134,8 +134,8 @@ function parseItem(item: any, defaultCategory: 'Video' | 'Shorts' | 'Live'): Raw
     const meta = lockup.metadata?.lockupMetadataViewModel;
     const title = meta?.title?.content || 'Untitled Video';
 
-    let accessType: 'Public' | 'Members-only' = 'Public';
-    let membershipLevel = 'Public';
+    let accessType: 'Public' | 'Members-only' = defaultCategory === 'Members-Only' ? 'Members-only' : 'Public';
+    let membershipLevel = defaultCategory === 'Members-Only' ? 'Members only' : 'Public';
 
     // Check badges
     const badges = meta?.badges || [];
@@ -289,7 +289,7 @@ async function fetchContinuationItems(
   apiKey: string,
   clientVersion: string,
   token: string,
-  category: 'Video' | 'Shorts' | 'Live'
+  category: 'Video' | 'Shorts' | 'Live' | 'Members-Only'
 ): Promise<{ items: RawItemResult[]; nextToken: string | null }> {
   try {
     const res = await fetch(`https://www.youtube.com/youtubei/v1/browse?key=${apiKey}&prettyPrint=false`, {
@@ -402,12 +402,13 @@ async function startServer() {
   });
 
   // API 2: Comprehensive Channel Scanner
-  app.post('/api/scan-channel', async (req: Request, res: Response) => {
+  app.post(['/api/scan', '/api/scan-channel'], async (req: Request, res: Response) => {
     const {
       channelInput,
       includeVideos = true,
       includeShorts = true,
       includeLive = true,
+      includeMembers = true,
       depth = 100,
       sortOrder = 'newest',
     } = req.body;
@@ -416,10 +417,11 @@ async function startServer() {
     const collectedVideos: RawItemResult[] = [];
     const seenIds = new Set<string>();
 
-    const tabsToScan: Array<{ tab: 'videos' | 'shorts' | 'streams'; category: 'Video' | 'Shorts' | 'Live' }> = [];
+    const tabsToScan: Array<{ tab: 'videos' | 'shorts' | 'streams' | 'membership'; category: 'Video' | 'Shorts' | 'Live' | 'Members-Only' }> = [];
     if (includeVideos) tabsToScan.push({ tab: 'videos', category: 'Video' });
     if (includeShorts) tabsToScan.push({ tab: 'shorts', category: 'Shorts' });
     if (includeLive) tabsToScan.push({ tab: 'streams', category: 'Live' });
+    if (includeMembers) tabsToScan.push({ tab: 'membership', category: 'Members-Only' });
 
     let channelMeta: any = {
       title: resolved,
@@ -429,7 +431,7 @@ async function startServer() {
       url: `https://www.youtube.com/${resolved}`,
     };
 
-    const targetMax = typeof depth === 'number' ? depth : 100;
+    const targetMax = typeof depth === 'number' ? depth : (depth === 'all' ? 10000 : 100);
 
     for (const { tab, category } of tabsToScan) {
       if (collectedVideos.length >= targetMax) break;
