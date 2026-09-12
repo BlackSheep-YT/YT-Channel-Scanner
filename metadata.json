@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Channel Scanner - Chrome Extension & Web Exporter",
+  "description": "Scan any YouTube channel for Videos, Shorts, and Live streams (including members-only videos without membership), sort date-wise, and export formatted CSV reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
